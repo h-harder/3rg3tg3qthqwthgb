@@ -1,205 +1,213 @@
-const $ = selector => document.querySelector(selector);
-const authCard = $('#authCard');
-const chatCard = $('#chatCard');
-const adminCard = $('#adminCard');
-const meBox = $('#meBox');
-const messagesBox = $('#messages');
-const usersBox = $('#users');
-const authError = $('#authError');
-const firstAccountNote = $('#firstAccountNote');
-const authTitle = $('#authTitle');
-const authSubmit = $('#authSubmit');
-const toggleAuth = $('#toggleAuth');
-const stats = $('#stats');
+'use strict';
 
-let mode = 'login';
+const $ = selector => document.querySelector(selector);
+const authPanel = $('#authPanel');
+const chatPanel = $('#chatPanel');
+const adminPanel = $('#adminPanel');
+const statusText = $('#statusText');
+const authError = $('#authError');
+const messagesEl = $('#messages');
+const usersList = $('#usersList');
+const userLine = $('#userLine');
+const badge = $('#connectionBadge');
+const logoutBtn = $('#logoutBtn');
 let me = null;
 let socket = null;
-let messages = new Map();
 
-function escapeHtml(value) {
-  return String(value || '').replace(/[&<>'"]/g, char => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
-  }[char]));
-}
-
-async function api(url, options = {}) {
-  const response = await fetch(url, {
+async function api(path, options = {}) {
+  const res = await fetch(path, {
     credentials: 'same-origin',
     headers: { 'content-type': 'application/json', ...(options.headers || {}) },
     ...options
   });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || response.statusText);
-  return data;
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(json.error || `Request failed: ${res.status}`);
+  return json;
 }
 
-function setMode(nextMode) {
-  mode = nextMode;
-  authTitle.textContent = mode === 'login' ? 'Sign in' : 'Create account';
-  authSubmit.textContent = mode === 'login' ? 'Sign in' : 'Create account';
-  toggleAuth.textContent = mode === 'login' ? 'Create an account instead' : 'Sign in instead';
-}
-
-function showAuth(firstAccountAvailable = false) {
-  authCard.classList.remove('hidden');
-  chatCard.classList.add('hidden');
-  adminCard.classList.add('hidden');
-  firstAccountNote.classList.toggle('hidden', !firstAccountAvailable);
-  if (firstAccountAvailable) setMode('register');
-  meBox.innerHTML = '';
+function showAuth() {
+  authPanel.classList.remove('hidden');
+  chatPanel.classList.add('hidden');
+  logoutBtn.classList.add('hidden');
+  statusText.textContent = 'Create the first account to become the moderator.';
 }
 
 function showChat() {
-  authCard.classList.add('hidden');
-  chatCard.classList.remove('hidden');
-  adminCard.classList.toggle('hidden', me.role !== 'moderator');
-  meBox.innerHTML = `
-    <span class="badge ${me.role === 'moderator' ? 'good' : ''}">${escapeHtml(me.username)} · ${escapeHtml(me.role)}</span>
-    <button id="logout" class="secondary small">Sign out</button>
-  `;
-  $('#logout').onclick = logout;
-  connectSocket();
-  loadMessages();
-  if (me.role === 'moderator') loadUsers();
+  authPanel.classList.add('hidden');
+  chatPanel.classList.remove('hidden');
+  logoutBtn.classList.remove('hidden');
+  userLine.textContent = `${me.displayName} (@${me.username}) · ${me.role}`;
+  adminPanel.classList.toggle('hidden', me.role !== 'moderator');
+  statusText.textContent = 'Connected to your self-hosted chat server.';
+}
+
+function escapeHtml(text) {
+  return String(text).replace(/[&<>'"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[ch]));
 }
 
 function renderMessage(message) {
+  if (!message || message.deleted) return;
   const existing = document.querySelector(`[data-message-id="${message.id}"]`);
-  const node = existing || document.createElement('div');
-  node.className = `message ${message.system ? 'system' : ''} ${message.deleted ? 'deleted' : ''}`;
-  node.dataset.messageId = message.id;
-  node.innerHTML = `
-    <div class="meta"><strong>${escapeHtml(message.username)}</strong><span>${new Date(message.createdAt).toLocaleString()}</span></div>
-    <div>${escapeHtml(message.text)}</div>
+  if (existing) return;
+  const el = document.createElement('div');
+  el.className = 'message';
+  el.dataset.messageId = message.id;
+  const date = new Date(message.createdAt).toLocaleString();
+  const deleteButton = me && me.role === 'moderator'
+    ? `<button class="secondary" data-delete-message="${message.id}">Delete</button>`
+    : '';
+  el.innerHTML = `
+    <div class="meta"><strong>${escapeHtml(message.displayName || message.username)}</strong><span>${escapeHtml(date)}</span></div>
+    <div class="body">${escapeHtml(message.text)}</div>
+    <div style="margin-top:.55rem">${deleteButton}</div>
   `;
-  if (!existing) messagesBox.appendChild(node);
-  messagesBox.scrollTop = messagesBox.scrollHeight;
-}
-
-function renderMessages() {
-  messagesBox.innerHTML = '';
-  for (const message of [...messages.values()].sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))) {
-    renderMessage(message);
-  }
+  messagesEl.appendChild(el);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
 async function loadMessages() {
-  const result = await api('/api/messages');
-  messages = new Map(result.messages.map(message => [message.id, message]));
-  renderMessages();
+  const { messages } = await api('/api/messages?limit=250');
+  messagesEl.innerHTML = '';
+  messages.forEach(renderMessage);
 }
 
 function connectSocket() {
   if (socket) socket.disconnect();
   socket = io({ withCredentials: true });
-  socket.on('messages:history', history => {
-    messages = new Map(history.map(message => [message.id, message]));
-    renderMessages();
+  socket.on('connect', () => {
+    badge.textContent = 'online';
+    badge.classList.add('online');
   });
-  socket.on('message:new', message => {
-    messages.set(message.id, message);
-    renderMessage(message);
+  socket.on('disconnect', () => {
+    badge.textContent = 'offline';
+    badge.classList.remove('online');
   });
-  socket.on('message:deleted', message => {
-    messages.set(message.id, message);
-    renderMessage(message);
+  socket.on('chat:message', renderMessage);
+  socket.on('chat:delete', payload => {
+    const el = document.querySelector(`[data-message-id="${payload.id}"]`);
+    if (el) el.remove();
   });
-  socket.on('server:stats', renderStats);
-  socket.on('server:sync', event => renderStats(event.stats));
-}
-
-function renderStats(serverStats) {
-  if (!serverStats) return;
-  stats.textContent = `${serverStats.users} users · ${serverStats.messages} messages · updated ${new Date(serverStats.updatedAt).toLocaleTimeString()}`;
+  socket.on('server:reset', () => location.reload());
+  socket.on('server:sync', () => loadMessages().catch(console.error));
 }
 
 async function loadUsers() {
-  const result = await api('/api/admin/users');
-  usersBox.innerHTML = result.users.map(user => `
-    <div class="user-row">
-      <div><strong>${escapeHtml(user.username)}</strong> <span class="badge">${escapeHtml(user.role)}</span> ${user.banned ? '<span class="badge">banned</span>' : ''}</div>
-      <div class="muted">Created ${new Date(user.createdAt).toLocaleString()}</div>
-      <div class="user-actions">
-        <button class="small" data-action="role" data-user="${user.id}" data-role="${user.role === 'moderator' ? 'member' : 'moderator'}">${user.role === 'moderator' ? 'Demote' : 'Promote'}</button>
-        <button class="small danger" data-action="ban" data-user="${user.id}" data-banned="${!user.banned}">${user.banned ? 'Unban' : 'Ban'}</button>
+  if (!me || me.role !== 'moderator') return;
+  const { users } = await api('/api/admin/users');
+  usersList.innerHTML = '';
+  for (const user of users) {
+    const row = document.createElement('div');
+    row.className = 'user-row';
+    row.innerHTML = `
+      <strong>${escapeHtml(user.displayName)}</strong><br />
+      <span class="muted">@${escapeHtml(user.username)} · ${escapeHtml(user.role)}${user.banned ? ' · banned' : ''}</span>
+      <div class="actions">
+        <button class="secondary" data-role="${user.id}" data-next-role="${user.role === 'moderator' ? 'user' : 'moderator'}">${user.role === 'moderator' ? 'Demote' : 'Promote'}</button>
+        <button class="${user.banned ? 'secondary' : 'danger'}" data-ban="${user.id}" data-next-ban="${!user.banned}">${user.banned ? 'Unban' : 'Ban'}</button>
       </div>
-    </div>
-  `).join('');
-
-  usersBox.querySelectorAll('button').forEach(button => {
-    button.onclick = async () => {
-      const userId = button.dataset.user;
-      if (button.dataset.action === 'role') {
-        await api(`/api/admin/users/${userId}/role`, { method: 'POST', body: JSON.stringify({ role: button.dataset.role }) });
-      } else {
-        await api(`/api/admin/users/${userId}/ban`, { method: 'POST', body: JSON.stringify({ banned: button.dataset.banned === 'true' }) });
-      }
-      await loadUsers();
-    };
-  });
+    `;
+    usersList.appendChild(row);
+  }
 }
 
-async function refreshMe() {
-  const result = await api('/api/me');
-  me = result.user;
-  if (!me) showAuth(result.firstAccountAvailable);
-  else showChat();
+async function boot() {
+  try {
+    const result = await api('/api/me');
+    me = result.user;
+    if (!me) return showAuth();
+    showChat();
+    await loadMessages();
+    await loadUsers();
+    connectSocket();
+  } catch (_) {
+    showAuth();
+  }
 }
 
-async function logout() {
-  await api('/api/logout', { method: 'POST' });
-  if (socket) socket.disconnect();
-  me = null;
-  showAuth(false);
-}
+$('#loginTab').addEventListener('click', () => {
+  $('#loginTab').classList.add('active');
+  $('#registerTab').classList.remove('active');
+  $('#loginForm').classList.remove('hidden');
+  $('#registerForm').classList.add('hidden');
+  authError.textContent = '';
+});
 
-$('#authForm').onsubmit = async event => {
+$('#registerTab').addEventListener('click', () => {
+  $('#registerTab').classList.add('active');
+  $('#loginTab').classList.remove('active');
+  $('#registerForm').classList.remove('hidden');
+  $('#loginForm').classList.add('hidden');
+  authError.textContent = '';
+});
+
+$('#loginForm').addEventListener('submit', async event => {
   event.preventDefault();
   authError.textContent = '';
+  const data = Object.fromEntries(new FormData(event.target).entries());
   try {
-    const payload = {
-      username: $('#username').value.trim(),
-      password: $('#password').value
-    };
-    const endpoint = mode === 'login' ? '/api/login' : '/api/register';
-    const result = await api(endpoint, { method: 'POST', body: JSON.stringify(payload) });
+    const result = await api('/api/login', { method: 'POST', body: JSON.stringify(data) });
     me = result.user;
-    showChat();
-  } catch (error) {
-    authError.textContent = error.message;
+    await boot();
+  } catch (err) {
+    authError.textContent = err.message;
   }
-};
+});
 
-toggleAuth.onclick = () => setMode(mode === 'login' ? 'register' : 'login');
+$('#registerForm').addEventListener('submit', async event => {
+  event.preventDefault();
+  authError.textContent = '';
+  const data = Object.fromEntries(new FormData(event.target).entries());
+  try {
+    const result = await api('/api/register', { method: 'POST', body: JSON.stringify(data) });
+    me = result.user;
+    await boot();
+  } catch (err) {
+    authError.textContent = err.message;
+  }
+});
 
-$('#messageForm').onsubmit = async event => {
+$('#messageForm').addEventListener('submit', event => {
   event.preventDefault();
   const input = $('#messageInput');
   const text = input.value.trim();
-  if (!text) return;
+  if (!text || !socket) return;
+  socket.emit('chat:send', { text }, response => {
+    if (!response || !response.ok) alert(response && response.error ? response.error : 'Message failed.');
+  });
   input.value = '';
-  try {
-    await api('/api/messages', { method: 'POST', body: JSON.stringify({ text }) });
-  } catch (error) {
-    alert(error.message);
-  }
-};
-
-$('#announcementForm').onsubmit = async event => {
-  event.preventDefault();
-  const textarea = $('#announcement');
-  const text = textarea.value.trim();
-  if (!text) return;
-  textarea.value = '';
-  try {
-    await api('/api/admin/system', { method: 'POST', body: JSON.stringify({ text }) });
-  } catch (error) {
-    alert(error.message);
-  }
-};
-
-refreshMe().catch(error => {
-  console.error(error);
-  showAuth(false);
 });
+
+messagesEl.addEventListener('click', async event => {
+  const id = event.target && event.target.dataset && event.target.dataset.deleteMessage;
+  if (!id) return;
+  if (!confirm('Delete this message?')) return;
+  try {
+    await api('/api/admin/delete-message', { method: 'POST', body: JSON.stringify({ id }) });
+  } catch (err) {
+    alert(err.message);
+  }
+});
+
+usersList.addEventListener('click', async event => {
+  const btn = event.target;
+  try {
+    if (btn.dataset.ban) {
+      await api('/api/admin/ban-user', { method: 'POST', body: JSON.stringify({ id: btn.dataset.ban, banned: btn.dataset.nextBan === 'true' }) });
+      await loadUsers();
+    }
+    if (btn.dataset.role) {
+      await api('/api/admin/role', { method: 'POST', body: JSON.stringify({ id: btn.dataset.role, role: btn.dataset.nextRole }) });
+      await loadUsers();
+    }
+  } catch (err) {
+    alert(err.message);
+  }
+});
+
+$('#refreshAdminBtn').addEventListener('click', () => loadUsers().catch(err => alert(err.message)));
+logoutBtn.addEventListener('click', async () => {
+  await api('/api/logout', { method: 'POST' }).catch(() => {});
+  location.reload();
+});
+
+boot();

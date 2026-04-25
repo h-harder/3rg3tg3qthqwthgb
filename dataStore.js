@@ -1,194 +1,280 @@
+'use strict';
+
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
 const DATA_DIR = path.join(__dirname, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'chat-data.json');
-const BACKUP_DIR = path.join(DATA_DIR, 'backups');
+const PID_FILE = path.join(DATA_DIR, 'server.pid');
 
 function now() {
   return new Date().toISOString();
 }
 
-function ensureDataDir() {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.mkdirSync(BACKUP_DIR, { recursive: true });
-}
-
 function id(prefix) {
-  return `${prefix}_${Date.now().toString(36)}_${crypto.randomBytes(5).toString('hex')}`;
+  return `${prefix}_${crypto.randomBytes(12).toString('hex')}`;
 }
 
-function emptyData() {
+function ensureDir() {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+function blankData() {
   return {
-    meta: {
-      createdAt: now(),
-      updatedAt: now(),
-      sequence: 0,
-      lastMergeAt: null
-    },
+    version: 1,
+    updatedAt: now(),
     users: [],
-    messages: []
+    messages: [],
+    sessions: []
   };
 }
 
-function normalizeData(data) {
-  const normalized = data && typeof data === 'object' ? data : emptyData();
-  normalized.meta = normalized.meta && typeof normalized.meta === 'object' ? normalized.meta : {};
-  normalized.meta.createdAt = normalized.meta.createdAt || now();
-  normalized.meta.updatedAt = normalized.meta.updatedAt || now();
-  normalized.meta.sequence = Number(normalized.meta.sequence || 0);
-  normalized.meta.lastMergeAt = normalized.meta.lastMergeAt || null;
-  normalized.users = Array.isArray(normalized.users) ? normalized.users : [];
-  normalized.messages = Array.isArray(normalized.messages) ? normalized.messages : [];
-  return normalized;
-}
-
-function loadData() {
-  ensureDataDir();
-  if (!fs.existsSync(DATA_FILE)) {
-    const data = emptyData();
-    saveData(data, { bump: false });
-    return data;
-  }
-
+function readJson(file, fallback) {
   try {
-    return normalizeData(JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')));
-  } catch (error) {
-    const backup = backupData(`corrupt-${Date.now()}`);
-    const data = emptyData();
-    saveData(data, { bump: false });
-    throw new Error(`Data file was corrupt. A backup was created at ${backup}. A new empty data file was created.`);
+    if (!fs.existsSync(file)) return fallback;
+    const raw = fs.readFileSync(file, 'utf8');
+    return raw.trim() ? JSON.parse(raw) : fallback;
+  } catch (err) {
+    return fallback;
   }
 }
 
-function saveData(data, options = {}) {
-  ensureDataDir();
-  const normalized = normalizeData(data);
-  if (options.bump !== false) {
-    normalized.meta.sequence = Number(normalized.meta.sequence || 0) + 1;
-    normalized.meta.updatedAt = now();
-  }
-  fs.writeFileSync(DATA_FILE, JSON.stringify(normalized, null, 2));
-  return normalized;
+function atomicWrite(file, obj) {
+  ensureDir();
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2));
+  fs.renameSync(tmp, file);
 }
 
-function backupData(label = 'backup') {
-  ensureDataDir();
-  const safeLabel = String(label).replace(/[^a-zA-Z0-9._-]/g, '-');
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const backupPath = path.join(BACKUP_DIR, `chat-data-${safeLabel}-${stamp}.json`);
-
-  if (fs.existsSync(DATA_FILE)) {
-    fs.copyFileSync(DATA_FILE, backupPath);
-  } else {
-    fs.writeFileSync(backupPath, JSON.stringify(emptyData(), null, 2));
-  }
-  return backupPath;
+function normalizeUsername(username) {
+  return String(username || '').trim().toLowerCase();
 }
 
-function resetData() {
-  const backupPath = backupData('before-reset');
-  const data = emptyData();
-  saveData(data, { bump: false });
-  return { data, backupPath };
-}
-
-function stripPrivateUserFields(user) {
+function safeUser(user) {
+  if (!user) return null;
   return {
     id: user.id,
     username: user.username,
+    displayName: user.displayName,
     role: user.role,
     banned: !!user.banned,
-    createdAt: user.createdAt,
-    lastSeenAt: user.lastSeenAt || null
+    createdAt: user.createdAt
   };
 }
 
-function publicMessage(message) {
-  return {
-    id: message.id,
-    userId: message.userId,
-    username: message.username,
-    text: message.deleted ? '[message deleted]' : message.text,
-    createdAt: message.createdAt,
-    deleted: !!message.deleted,
-    deletedAt: message.deletedAt || null,
-    deletedBy: message.deletedBy || null,
-    system: !!message.system
-  };
+function hashPassword(password, salt) {
+  return crypto.scryptSync(String(password), salt, 64).toString('hex');
 }
 
-function isNewer(a, b) {
-  const at = new Date(a.updatedAt || a.createdAt || 0).getTime();
-  const bt = new Date(b.updatedAt || b.createdAt || 0).getTime();
-  return at >= bt;
+function tokenHash(token) {
+  return crypto.createHash('sha256').update(token).digest('hex');
 }
 
-function mergeById(localItems, remoteItems) {
-  const map = new Map();
-  for (const item of localItems || []) {
-    if (item && item.id) map.set(item.id, item);
+class Store {
+  constructor() {
+    ensureDir();
+    this.data = readJson(DATA_FILE, blankData());
+    this.normalize();
+    this.save(false);
   }
-  for (const item of remoteItems || []) {
-    if (!item || !item.id) continue;
-    const existing = map.get(item.id);
-    if (!existing || isNewer(item, existing)) {
-      map.set(item.id, item);
-    }
+
+  normalize() {
+    this.data.version = this.data.version || 1;
+    this.data.updatedAt = this.data.updatedAt || now();
+    this.data.users = Array.isArray(this.data.users) ? this.data.users : [];
+    this.data.messages = Array.isArray(this.data.messages) ? this.data.messages : [];
+    this.data.sessions = Array.isArray(this.data.sessions) ? this.data.sessions : [];
   }
-  return [...map.values()];
-}
 
-function mergeData(localData, remoteData) {
-  const local = normalizeData(localData);
-  const remote = normalizeData(remoteData);
+  reload() {
+    this.data = readJson(DATA_FILE, blankData());
+    this.normalize();
+    return this.data;
+  }
 
-  const merged = {
-    meta: {
-      createdAt: local.meta.createdAt || remote.meta.createdAt || now(),
-      updatedAt: now(),
-      sequence: Math.max(Number(local.meta.sequence || 0), Number(remote.meta.sequence || 0)) + 1,
-      lastMergeAt: now(),
-      lastRemoteUpdatedAt: remote.meta.updatedAt || null,
-      lastRemoteSequence: remote.meta.sequence || 0
-    },
-    users: mergeById(local.users, remote.users),
-    messages: mergeById(local.messages, remote.messages)
-  };
+  save(touch = true) {
+    if (touch) this.data.updatedAt = now();
+    atomicWrite(DATA_FILE, this.data);
+  }
 
-  merged.users.sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
-  merged.messages.sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
-  return merged;
-}
+  exportData() {
+    this.reload();
+    return JSON.parse(JSON.stringify(this.data));
+  }
 
-function getStats(data = loadData()) {
-  const normalized = normalizeData(data);
-  return {
-    users: normalized.users.length,
-    moderators: normalized.users.filter(u => u.role === 'moderator').length,
-    bannedUsers: normalized.users.filter(u => u.banned).length,
-    messages: normalized.messages.length,
-    deletedMessages: normalized.messages.filter(m => m.deleted).length,
-    updatedAt: normalized.meta.updatedAt,
-    sequence: normalized.meta.sequence
-  };
+  replaceData(nextData) {
+    const clean = nextData && typeof nextData === 'object' ? nextData : blankData();
+    this.data = {
+      version: 1,
+      updatedAt: clean.updatedAt || now(),
+      users: Array.isArray(clean.users) ? clean.users : [],
+      messages: Array.isArray(clean.messages) ? clean.messages : [],
+      sessions: Array.isArray(clean.sessions) ? clean.sessions : []
+    };
+    atomicWrite(DATA_FILE, this.data);
+  }
+
+  reset() {
+    this.data = blankData();
+    this.save(false);
+  }
+
+  getUpdatedAtMs() {
+    this.reload();
+    return Date.parse(this.data.updatedAt || '') || 0;
+  }
+
+  createUser({ username, displayName, password }) {
+    this.reload();
+    const uname = normalizeUsername(username);
+    if (!uname || uname.length < 3) throw new Error('Username must be at least 3 characters.');
+    if (!/^[a-z0-9._-]+$/.test(uname)) throw new Error('Username may only contain letters, numbers, dots, underscores, and hyphens.');
+    if (!password || String(password).length < 8) throw new Error('Password must be at least 8 characters.');
+    if (this.data.users.some(u => u.username === uname)) throw new Error('That username is already taken.');
+
+    const salt = crypto.randomBytes(16).toString('hex');
+    const firstAccount = this.data.users.length === 0;
+    const user = {
+      id: id('usr'),
+      username: uname,
+      displayName: String(displayName || username || uname).trim().slice(0, 80) || uname,
+      salt,
+      passwordHash: hashPassword(password, salt),
+      role: firstAccount ? 'moderator' : 'user',
+      banned: false,
+      createdAt: now()
+    };
+    this.data.users.push(user);
+    this.save(true);
+    return safeUser(user);
+  }
+
+  verifyLogin(username, password) {
+    this.reload();
+    const uname = normalizeUsername(username);
+    const user = this.data.users.find(u => u.username === uname);
+    if (!user) return null;
+    if (user.banned) throw new Error('This account is banned.');
+    const candidate = hashPassword(password, user.salt);
+    const ok = crypto.timingSafeEqual(Buffer.from(candidate, 'hex'), Buffer.from(user.passwordHash, 'hex'));
+    return ok ? safeUser(user) : null;
+  }
+
+  createSession(userId) {
+    this.reload();
+    const token = crypto.randomBytes(32).toString('base64url');
+    const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24 * 30).toISOString();
+    this.data.sessions = this.data.sessions.filter(s => Date.parse(s.expiresAt) > Date.now());
+    this.data.sessions.push({ tokenHash: tokenHash(token), userId, createdAt: now(), expiresAt });
+    this.save(true);
+    return { token, expiresAt };
+  }
+
+  deleteSession(token) {
+    if (!token) return;
+    this.reload();
+    const h = tokenHash(token);
+    this.data.sessions = this.data.sessions.filter(s => s.tokenHash !== h);
+    this.save(true);
+  }
+
+  getUserByToken(token) {
+    if (!token) return null;
+    this.reload();
+    const h = tokenHash(token);
+    const session = this.data.sessions.find(s => s.tokenHash === h && Date.parse(s.expiresAt) > Date.now());
+    if (!session) return null;
+    const user = this.data.users.find(u => u.id === session.userId);
+    if (!user || user.banned) return null;
+    return safeUser(user);
+  }
+
+  listUsers() {
+    this.reload();
+    return this.data.users.map(safeUser);
+  }
+
+  isModerator(userId) {
+    this.reload();
+    const user = this.data.users.find(u => u.id === userId);
+    return !!user && user.role === 'moderator' && !user.banned;
+  }
+
+  setUserBan(userId, banned) {
+    this.reload();
+    const user = this.data.users.find(u => u.id === userId);
+    if (!user) throw new Error('User not found.');
+    user.banned = !!banned;
+    this.save(true);
+    return safeUser(user);
+  }
+
+  setUserRole(userId, role) {
+    this.reload();
+    if (!['user', 'moderator'].includes(role)) throw new Error('Invalid role.');
+    const user = this.data.users.find(u => u.id === userId);
+    if (!user) throw new Error('User not found.');
+    user.role = role;
+    this.save(true);
+    return safeUser(user);
+  }
+
+  listMessages(limit = 200, includeDeleted = false) {
+    this.reload();
+    const messages = includeDeleted ? this.data.messages : this.data.messages.filter(m => !m.deleted);
+    return messages.slice(-Math.max(1, Math.min(Number(limit) || 200, 1000)));
+  }
+
+  addMessage(user, text) {
+    this.reload();
+    const cleanText = String(text || '').trim();
+    if (!cleanText) throw new Error('Message cannot be empty.');
+    if (cleanText.length > 2000) throw new Error('Message is too long.');
+    const message = {
+      id: id('msg'),
+      userId: user.id,
+      username: user.username,
+      displayName: user.displayName,
+      text: cleanText,
+      createdAt: now(),
+      deleted: false
+    };
+    this.data.messages.push(message);
+    this.save(true);
+    return message;
+  }
+
+  deleteMessage(messageId, deletedBy = 'system') {
+    this.reload();
+    const message = this.data.messages.find(m => m.id === messageId);
+    if (!message) throw new Error('Message not found.');
+    message.deleted = true;
+    message.deletedAt = now();
+    message.deletedBy = deletedBy;
+    this.save(true);
+    return message;
+  }
+
+  writePid() {
+    ensureDir();
+    fs.writeFileSync(PID_FILE, String(process.pid));
+  }
+
+  removePid() {
+    try {
+      if (fs.existsSync(PID_FILE) && fs.readFileSync(PID_FILE, 'utf8').trim() === String(process.pid)) {
+        fs.unlinkSync(PID_FILE);
+      }
+    } catch (_) {}
+  }
 }
 
 module.exports = {
+  Store,
   DATA_DIR,
   DATA_FILE,
-  BACKUP_DIR,
-  now,
-  id,
-  emptyData,
-  normalizeData,
-  loadData,
-  saveData,
-  backupData,
-  resetData,
-  stripPrivateUserFields,
-  publicMessage,
-  mergeData,
-  getStats
+  PID_FILE,
+  blankData,
+  now
 };

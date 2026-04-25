@@ -1,70 +1,70 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>HomeChat</title>
-  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
-  <main class="shell">
-    <section class="card header-card">
+  <div class="app-shell">
+    <header class="topbar">
       <div>
         <h1>HomeChat</h1>
-        <p id="subtitle">Self-hosted local chat</p>
+        <p id="statusText">Checking session...</p>
       </div>
-      <div id="meBox" class="me-box"></div>
-    </section>
+      <button id="logoutBtn" class="secondary hidden">Log out</button>
+    </header>
 
-    <section id="authCard" class="card hidden">
-      <h2 id="authTitle">Sign in</h2>
-      <p id="firstAccountNote" class="notice hidden">No accounts exist yet. The first account you create becomes the moderator.</p>
-      <form id="authForm">
-        <label>
-          Username
-          <input id="username" autocomplete="username" required minlength="3" maxlength="24" placeholder="Ryan">
-        </label>
-        <label>
-          Password
-          <input id="password" type="password" autocomplete="current-password" required minlength="8" placeholder="At least 8 characters">
-        </label>
-        <button id="authSubmit" type="submit">Sign in</button>
-      </form>
-      <button id="toggleAuth" class="link-button">Create an account instead</button>
-      <p id="authError" class="error"></p>
-    </section>
-
-    <section id="chatCard" class="card hidden">
-      <div class="chat-topline">
-        <h2>Chat</h2>
-        <div id="stats" class="stats"></div>
-      </div>
-      <div id="messages" class="messages" aria-live="polite"></div>
-      <form id="messageForm" class="message-form">
-        <input id="messageInput" maxlength="2000" placeholder="Type a message..." autocomplete="off">
-        <button type="submit">Send</button>
-      </form>
-    </section>
-
-    <section id="adminCard" class="card hidden">
-      <h2>Moderator Panel</h2>
-      <div class="admin-grid">
-        <div>
-          <h3>Users</h3>
-          <div id="users"></div>
+    <main>
+      <section id="authPanel" class="card auth-card">
+        <h2>Sign in</h2>
+        <p class="muted">Create the first account to become the moderator.</p>
+        <div class="tabs">
+          <button id="loginTab" class="active">Login</button>
+          <button id="registerTab">Create account</button>
         </div>
-        <div>
-          <h3>System Announcement</h3>
-          <form id="announcementForm" class="stack">
-            <textarea id="announcement" rows="4" maxlength="2000" placeholder="Post a system message..."></textarea>
-            <button type="submit">Post Announcement</button>
+
+        <form id="loginForm" class="stack">
+          <label>Username<input name="username" autocomplete="username" required /></label>
+          <label>Password<input name="password" type="password" autocomplete="current-password" required /></label>
+          <button type="submit">Login</button>
+        </form>
+
+        <form id="registerForm" class="stack hidden">
+          <label>Display name<input name="displayName" autocomplete="name" placeholder="Ryan" /></label>
+          <label>Username<input name="username" autocomplete="username" required /></label>
+          <label>Password<input name="password" type="password" autocomplete="new-password" minlength="8" required /></label>
+          <button type="submit">Create account</button>
+        </form>
+        <p id="authError" class="error"></p>
+      </section>
+
+      <section id="chatPanel" class="chat-layout hidden">
+        <section class="card chat-card">
+          <div class="chat-header">
+            <div>
+              <h2>Chat</h2>
+              <p id="userLine" class="muted"></p>
+            </div>
+            <span id="connectionBadge" class="badge">offline</span>
+          </div>
+          <div id="messages" class="messages" aria-live="polite"></div>
+          <form id="messageForm" class="message-form">
+            <input id="messageInput" maxlength="2000" placeholder="Type a message..." autocomplete="off" />
+            <button type="submit">Send</button>
           </form>
-          <p class="muted">More powerful tools are available from the terminal command: <code>homechat</code></p>
-        </div>
-      </div>
-    </section>
-  </main>
+        </section>
 
+        <aside id="adminPanel" class="card admin-card hidden">
+          <h2>Moderator</h2>
+          <p class="muted">Delete messages, ban users, or promote moderators.</p>
+          <button id="refreshAdminBtn" class="secondary">Refresh users</button>
+          <div id="usersList" class="users-list"></div>
+        </aside>
+      </section>
+    </main>
+  </div>
   <script src="/socket.io/socket.io.js"></script>
   <script src="/app.js"></script>
 </body>

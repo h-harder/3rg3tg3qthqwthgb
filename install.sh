@@ -2,314 +2,127 @@
 set -euo pipefail
 
 APP_NAME="homechat-handoff"
-INSTALL_DIR="${SIMPLE_CHAT_HOME:-$HOME/.simple-chat-server}"
-REPO="${SIMPLE_CHAT_REPO:-}"
-REF="${SIMPLE_CHAT_REF:-main}"
+INSTALL_DIR="${HOMECHAT_HOME:-$HOME/.homechat}"
+REPO="${HOMECHAT_REPO:-${SIMPLE_CHAT_REPO:-}}"
+REF="${HOMECHAT_REF:-main}"
 TMP_DIR=""
 
-# Print logs to stderr so command substitution can safely capture only data values.
 info() { printf '\n[HomeChat] %s\n' "$1" >&2; }
 warn() { printf '\n[HomeChat WARNING] %s\n' "$1" >&2; }
 fail() { printf '\n[HomeChat ERROR] %s\n' "$1" >&2; exit 1; }
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 cleanup() {
-  if [ -n "${TMP_DIR:-}" ] && [ -d "$TMP_DIR" ]; then
-    rm -rf "$TMP_DIR"
-  fi
+  if [ -n "${TMP_DIR:-}" ] && [ -d "$TMP_DIR" ]; then rm -rf "$TMP_DIR"; fi
 }
 trap cleanup EXIT
 
-version_major() {
-  "$1" -v 2>/dev/null | sed 's/^v//' | cut -d. -f1
-}
+version_major() { "$1" -v 2>/dev/null | sed 's/^v//' | cut -d. -f1; }
 
-install_linux_prereqs() {
-  if need_cmd apt-get; then
-    sudo apt-get update
-    sudo apt-get install -y curl unzip ca-certificates
-  fi
-}
-
-install_node_linux_if_needed() {
+install_node_macos_if_needed() {
   if need_cmd node && need_cmd npm; then
     local major
     major="$(version_major node || echo 0)"
-    if [ "${major:-0}" -ge 18 ]; then
-      return 0
-    fi
+    if [ "${major:-0}" -ge 18 ]; then return 0; fi
   fi
 
-  warn "Node.js 18+ was not found. Installing current Node.js LTS using the NodeSource apt repository."
-  if ! need_cmd curl; then install_linux_prereqs; fi
-  curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
-  sudo apt-get install -y nodejs
+  info "Node.js 18+ was not found. Installing the latest Node.js LTS pkg from nodejs.org. This may ask for your Mac password."
+  need_cmd curl || fail "curl is required."
+  need_cmd awk || fail "awk is required."
+  local version url pkg
+  version="$(curl -fsSL https://nodejs.org/dist/index.json | awk 'BEGIN{RS="{"} /"lts":"[^"]+"/ { if (match($0, /"version":"v[^"]+"/)) { print substr($0, RSTART+11, RLENGTH-12); exit } }')"
+  [ -n "$version" ] || fail "Could not determine current Node.js LTS version. Install Node.js LTS from https://nodejs.org and rerun this installer."
+  url="https://nodejs.org/dist/${version}/node-${version}.pkg"
+  pkg="/tmp/node-${version}.pkg"
+  curl -fsSL "$url" -o "$pkg"
+  sudo installer -pkg "$pkg" -target /
+  rm -f "$pkg"
+
+  if ! need_cmd node || ! need_cmd npm; then
+    fail "Node.js installed, but node/npm are not available in this shell yet. Open a new Terminal window and rerun this installer."
+  fi
 }
 
-check_node_macos() {
-  if ! need_cmd node || ! need_cmd npm; then
-    fail "Node.js 18+ is required on macOS. Install the Node.js LTS package from nodejs.org, then rerun this installer."
-  fi
+check_node() {
+  case "$(uname -s)" in
+    Darwin) install_node_macos_if_needed ;;
+    *) fail "This installer is for macOS. For Windows 11, use install.ps1 from PowerShell." ;;
+  esac
   local major
   major="$(version_major node || echo 0)"
-  if [ "${major:-0}" -lt 18 ]; then
-    fail "Node.js 18+ is required. Your node version is $(node -v). Install Node.js LTS from nodejs.org, then rerun this installer."
-  fi
+  [ "${major:-0}" -ge 18 ] || fail "Node.js 18+ is required. Current: $(node -v 2>/dev/null || echo none)."
 }
 
 find_source_dir() {
-  local script_ref="${BASH_SOURCE[0]-}"
-  local here=""
-
-  # This supports running ./install.sh from an extracted folder.
-  # When the script is piped into bash through curl, BASH_SOURCE is not a real file,
-  # so this block is skipped and the repo ZIP download below is used instead.
-  if [ -n "$script_ref" ] && [ -f "$script_ref" ]; then
-    here="$(cd "$(dirname "$script_ref")" >/dev/null 2>&1 && pwd || true)"
-    if [ -n "$here" ] && [ -f "$here/package.json" ] && [ -f "$here/server.js" ]; then
-      printf '%s\n' "$here"
-      return 0
-    fi
+  if [ -n "$REPO" ]; then
+    TMP_DIR="$(mktemp -d)"
+    local zip="$TMP_DIR/source.zip"
+    local url="https://github.com/${REPO}/archive/refs/heads/${REF}.zip"
+    info "Downloading $url"
+    curl -fsSL "$url" -o "$zip"
+    unzip -q "$zip" -d "$TMP_DIR"
+    local found
+    found="$(find "$TMP_DIR" -mindepth 1 -maxdepth 2 -type f -name package.json -print -quit | xargs dirname)"
+    [ -n "$found" ] && [ -d "$found" ] || fail "Could not find package.json inside downloaded repo zip."
+    printf '%s\n' "$found"
+    return
   fi
 
-  if [ -z "$REPO" ]; then
-    fail "When running via curl, set SIMPLE_CHAT_REPO first. Example: curl -fsSL https://raw.githubusercontent.com/YOURNAME/YOURREPO/main/install.sh | SIMPLE_CHAT_REPO=YOURNAME/YOURREPO bash"
+  local source_path="${BASH_SOURCE[0]:-}"
+  if [ -n "$source_path" ] && [ -f "$source_path" ]; then
+    local dir
+    dir="$(cd "$(dirname "$source_path")" && pwd)"
+    [ -f "$dir/package.json" ] && { printf '%s\n' "$dir"; return; }
   fi
 
-  TMP_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t homechat)"
-  local zip="$TMP_DIR/source.zip"
-  local src_dir=""
-
-  info "Downloading https://github.com/$REPO/archive/refs/heads/$REF.zip"
-  curl -fsSL -o "$zip" "https://github.com/$REPO/archive/refs/heads/$REF.zip"
-  unzip -q "$zip" -d "$TMP_DIR"
-
-  # GitHub normally extracts to repo-ref/, but do not assume the exact folder name.
-  src_dir="$(find "$TMP_DIR" -mindepth 1 -maxdepth 1 -type d | head -n 1 || true)"
-  if [ -z "$src_dir" ] || [ ! -d "$src_dir" ]; then
-    fail "Downloaded the repo ZIP, but could not find the extracted source folder. Check that the repo exists and has files in the $REF branch."
-  fi
-  if [ ! -f "$src_dir/package.json" ] || [ ! -f "$src_dir/server.js" ]; then
-    fail "The downloaded repo does not look like the HomeChat app. Make sure package.json and server.js are in the repository root."
-  fi
-
-  printf '%s\n' "$src_dir"
+  fail "No source directory found. For curl install, set HOMECHAT_REPO, for example: HOMECHAT_REPO=h-harder/3rg3tg3qthqwthgb bash"
 }
 
-copy_app() {
-  local src="$1"
-  if [ -z "$src" ] || [ ! -d "$src" ]; then
-    fail "Source folder was not found: ${src:-empty}"
-  fi
-
-  info "Installing app to $INSTALL_DIR"
-  mkdir -p "$INSTALL_DIR"
-
-  local keep
-  keep="$(mktemp -d 2>/dev/null || mktemp -d -t homechat-keep)"
-  if [ -f "$INSTALL_DIR/.env" ]; then cp "$INSTALL_DIR/.env" "$keep/.env"; fi
-  if [ -d "$INSTALL_DIR/data" ]; then cp -R "$INSTALL_DIR/data" "$keep/data"; fi
-
-  (cd "$src" && tar -cf - .) | (cd "$INSTALL_DIR" && tar -xf -)
-
-  if [ -f "$keep/.env" ]; then cp "$keep/.env" "$INSTALL_DIR/.env"; fi
-  if [ -d "$keep/data" ]; then rm -rf "$INSTALL_DIR/data" && cp -R "$keep/data" "$INSTALL_DIR/data"; fi
-  rm -rf "$keep"
+generate_hex() {
+  node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 }
 
-generate_env() {
-  cd "$INSTALL_DIR"
-  if [ ! -f .env ]; then cp .env.example .env; fi
-
-  node <<'NODE'
-const fs = require('fs');
-const crypto = require('crypto');
-const os = require('os');
-let text = fs.readFileSync('.env', 'utf8');
-const values = {
-  SESSION_SECRET: crypto.randomBytes(32).toString('hex'),
-  ADMIN_KEY: crypto.randomBytes(32).toString('hex'),
-  INSTANCE_ID: `${os.hostname()}-${crypto.randomBytes(3).toString('hex')}`
-};
-for (const [key, value] of Object.entries(values)) {
-  const re = new RegExp(`^${key}=.*$`, 'm');
-  const match = text.match(re);
-  if (match && !match[0].includes('CHANGE_ME')) continue;
-  if (match) text = text.replace(re, `${key}=${value}`);
-  else text += `\n${key}=${value}\n`;
-}
-fs.writeFileSync('.env', text.endsWith('\n') ? text : `${text}\n`);
-NODE
+write_env_if_missing() {
+  local env_file="$INSTALL_DIR/.env"
+  if [ -f "$env_file" ]; then return 0; fi
+  cat > "$env_file" <<EOF_ENV
+PORT=3000
+APP_NAME=HomeChat
+SESSION_SECRET=$(generate_hex)
+ADMIN_KEY=$(generate_hex)
+PEER_URL=
+HANDOFF_ON_START=true
+EOF_ENV
 }
 
-install_node_deps() {
-  cd "$INSTALL_DIR"
-  info "Installing Node dependencies"
-  npm install --omit=dev
-}
-
-install_linux_services() {
-  local node_path
-  node_path="$(command -v node)"
-  mkdir -p "$HOME/.config/systemd/user"
-
-  cat > "$HOME/.config/systemd/user/simple-chat.service" <<EOF2
-[Unit]
-Description=HomeChat Handoff Server
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=$INSTALL_DIR
-ExecStart=$node_path server.js
-Restart=on-failure
-RestartSec=3
-Environment=NODE_ENV=production
-
-[Install]
-WantedBy=default.target
-EOF2
-
-  cat > "$HOME/.config/systemd/user/simple-chat-awake.service" <<'EOF2'
-[Unit]
-Description=Keep this Linux machine awake for HomeChat
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/systemd-inhibit --what=sleep:idle:handle-lid-switch --why=HomeChat /bin/sh -c 'while true; do sleep 3600; done'
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=default.target
-EOF2
-
-  systemctl --user daemon-reload
-  systemctl --user enable simple-chat.service
-
-  if command -v loginctl >/dev/null 2>&1; then
-    sudo loginctl enable-linger "$USER" || true
-  fi
-}
-
-xml_escape() {
-  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
-}
-
-install_macos_services() {
-  local node_path escaped_node escaped_dir escaped_log
-  node_path="$(command -v node)"
-  escaped_node="$(xml_escape "$node_path")"
-  escaped_dir="$(xml_escape "$INSTALL_DIR")"
-  escaped_log="$(xml_escape "$INSTALL_DIR/data/server.log")"
-  mkdir -p "$HOME/Library/LaunchAgents" "$INSTALL_DIR/data"
-
-  cat > "$HOME/Library/LaunchAgents/com.simplechat.server.plist" <<EOF2
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.simplechat.server</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>$escaped_node</string>
-    <string>server.js</string>
-  </array>
-  <key>WorkingDirectory</key><string>$escaped_dir</string>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key>
-  <dict>
-    <key>SuccessfulExit</key><false/>
-  </dict>
-  <key>StandardOutPath</key><string>$escaped_log</string>
-  <key>StandardErrorPath</key><string>$escaped_log</string>
-</dict>
-</plist>
-EOF2
-
-  cat > "$HOME/Library/LaunchAgents/com.simplechat.awake.plist" <<'EOF2'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.simplechat.awake</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/usr/bin/caffeinate</string>
-    <string>-dimsu</string>
-  </array>
-  <key>RunAtLoad</key><false/>
-  <key>KeepAlive</key><true/>
-  <key>Disabled</key><true/>
-  <key>StandardOutPath</key><string>/tmp/simplechat-awake.log</string>
-  <key>StandardErrorPath</key><string>/tmp/simplechat-awake.log</string>
-</dict>
-</plist>
-EOF2
-}
-
-install_wrapper() {
+install_command() {
   local bin_dir="$HOME/.local/bin"
   mkdir -p "$bin_dir"
-  cat > "$bin_dir/homechat" <<EOF2
+  cat > "$bin_dir/homechat" <<EOF_BIN
 #!/usr/bin/env bash
-cd "$INSTALL_DIR"
-exec "$(command -v node)" cli.js "\$@"
-EOF2
+set -euo pipefail
+exec node "$INSTALL_DIR/cli.js" "\$@"
+EOF_BIN
   chmod +x "$bin_dir/homechat"
-
-  case ":$PATH:" in
-    *":$bin_dir:"*) ;;
-    *) warn "$bin_dir is not currently in your PATH. You can still run: $bin_dir/homechat" ;;
-  esac
-}
-
-start_service() {
-  local os_name="$1"
-  if [ "$os_name" = "Linux" ]; then
-    systemctl --user restart simple-chat.service
-  elif [ "$os_name" = "Darwin" ]; then
-    launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.simplechat.server.plist" >/dev/null 2>&1 || true
-    launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.simplechat.server.plist" >/dev/null 2>&1 || true
-    launchctl kickstart -k "gui/$(id -u)/com.simplechat.server" >/dev/null 2>&1 || true
-  fi
 }
 
 main() {
-  local os_name
-  os_name="$(uname -s)"
-
-  if [ "$os_name" = "Linux" ]; then
-    install_linux_prereqs
-    install_node_linux_if_needed
-  elif [ "$os_name" = "Darwin" ]; then
-    check_node_macos
-  else
-    fail "Unsupported OS: $os_name. This installer supports Ubuntu/Linux systemd and macOS."
-  fi
-
-  need_cmd npm || fail "npm is required but was not found."
-  need_cmd unzip || fail "unzip is required but was not found."
-  need_cmd tar || fail "tar is required but was not found."
-
+  check_node
+  need_cmd curl || fail "curl is required."
+  need_cmd unzip || fail "unzip is required."
   local src
   src="$(find_source_dir)"
-  copy_app "$src"
-  generate_env
-  install_node_deps
-  install_wrapper
-
-  if [ "$os_name" = "Linux" ]; then install_linux_services; fi
-  if [ "$os_name" = "Darwin" ]; then install_macos_services; fi
-
-  start_service "$os_name"
-
-  info "Installed and started."
-  echo "Open the terminal menu with: $HOME/.local/bin/homechat"
-  echo "Or run: cd $INSTALL_DIR && npm run menu"
-  echo "Local URL: http://127.0.0.1:$(grep '^PORT=' "$INSTALL_DIR/.env" | cut -d= -f2)"
-  echo "The first account created in the web app becomes the moderator."
+  info "Installing app to $INSTALL_DIR"
+  mkdir -p "$INSTALL_DIR"
+  # Copy source without carrying over data/logs/backups from a prior install package.
+  (cd "$src" && tar --exclude='./data' --exclude='./logs' --exclude='./backups' -cf - .) | (cd "$INSTALL_DIR" && tar -xf -)
+  mkdir -p "$INSTALL_DIR/data" "$INSTALL_DIR/logs" "$INSTALL_DIR/backups"
+  cd "$INSTALL_DIR"
+  npm install --omit=dev
+  write_env_if_missing
+  install_command
+  info "Installed. Open the control menu with: $HOME/.local/bin/homechat"
+  info "You may need to open a new Terminal window before 'homechat' works without the full path."
 }
 
 main "$@"
